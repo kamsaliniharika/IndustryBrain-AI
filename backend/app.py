@@ -18,7 +18,7 @@ from docx import Document
 import pytesseract
 from PIL import Image
 
-from sentence_transformers import SentenceTransformer
+from google.genai import types
 import faiss
 import numpy as np
 
@@ -61,16 +61,44 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 # --------------------------------------------------
-# AI Embedding Model
+# Gemini Embedding Configuration
 # --------------------------------------------------
 
-print("Loading embedding model...")
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSION = 768
+EMBEDDING_BATCH_SIZE = 32
 
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
 
-print("Embedding model loaded successfully.")
+def create_embeddings(texts, task_type="RETRIEVAL_DOCUMENT"):
+    """
+    Create embeddings with Gemini instead of loading a local
+    SentenceTransformer/PyTorch model.
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+
+    if not texts:
+        return np.empty((0, EMBEDDING_DIMENSION), dtype="float32")
+
+    all_embeddings = []
+
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+
+        result = gemini_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=EMBEDDING_DIMENSION,
+            ),
+        )
+
+        all_embeddings.extend(
+            embedding.values for embedding in result.embeddings
+        )
+
+    return np.asarray(all_embeddings, dtype="float32")
 
 
 # --------------------------------------------------
@@ -365,12 +393,10 @@ def create_faiss_index(filename, chunks):
 
     print(f"Creating embeddings for {filename}...")
 
-    embeddings = embedding_model.encode(
+    embeddings = create_embeddings(
         chunks,
-        convert_to_numpy=True
+        task_type="RETRIEVAL_DOCUMENT"
     )
-
-    embeddings = embeddings.astype("float32")
 
     dimension = embeddings.shape[1]
 
@@ -637,10 +663,10 @@ def semantic_search():
         index = document["index"]
         chunks = document["chunks"]
 
-        query_embedding = embedding_model.encode(
+        query_embedding = create_embeddings(
             [query],
-            convert_to_numpy=True
-        ).astype("float32")
+            task_type="RETRIEVAL_QUERY"
+        )
 
         distances, indices = index.search(
             query_embedding,
@@ -817,10 +843,10 @@ def ask_gemini():
         chunks = document["chunks"]
 
         # Create embedding for user's question
-        query_embedding = embedding_model.encode(
+        query_embedding = create_embeddings(
             [query],
-            convert_to_numpy=True
-        ).astype("float32")
+            task_type="RETRIEVAL_QUERY"
+        )
 
         # Search relevant chunks from selected document
         distances, indices = index.search(
