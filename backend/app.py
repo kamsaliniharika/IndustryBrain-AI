@@ -110,6 +110,10 @@ def create_embeddings(texts, task_type="RETRIEVAL_DOCUMENT"):
 
 documents = {}
 
+# Cache extracted text so /index does not run OCR a second time
+# immediately after /extract for the same user/document.
+extracted_text_cache = {}
+
 # --------------------------------------------------
 # Authentication Database
 # --------------------------------------------------
@@ -292,14 +296,27 @@ def extract_text_from_file(file_path):
 
         # OCR fallback for scanned PDFs
         if not extracted_text:
-
             ocr_text = []
 
             for page in document:
-
+                # 1x rendering is much faster and uses less memory than 2x.
                 pix = page.get_pixmap(
-                    matrix=fitz.Matrix(2, 2)
+                    matrix=fitz.Matrix(1, 1),
+                    alpha=False
                 )
+
+                # Keep very large pages from creating unnecessarily huge OCR images.
+                max_dimension = 1800
+                scale = min(
+                    1.0,
+                    max_dimension / max(pix.width, pix.height)
+                )
+
+                if scale < 1.0:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(scale, scale),
+                        alpha=False
+                    )
 
                 image = Image.frombytes(
                     "RGB",
@@ -309,7 +326,8 @@ def extract_text_from_file(file_path):
 
                 page_ocr = pytesseract.image_to_string(
                     image,
-                    lang="eng"
+                    lang="eng",
+                    config="--psm 6"
                 )
 
                 if page_ocr.strip():
@@ -566,6 +584,10 @@ def extract_document(filename):
     try:
         text = extract_text_from_file(file_path)
 
+        # Reuse this text during the following /index request.
+        index_key = document_index_key(user["id"], filename)
+        extracted_text_cache[index_key] = text
+
         return jsonify({
             "filename": filename,
             "text": text,
@@ -602,7 +624,14 @@ def index_document(filename):
         }), 404
 
     try:
-        text = extract_text_from_file(file_path)
+        index_key = document_index_key(user["id"], filename)
+
+        # Reuse /extract output instead of running OCR a second time.
+        text = extracted_text_cache.get(index_key)
+
+        if text is None:
+            text = extract_text_from_file(file_path)
+            extracted_text_cache[index_key] = text
 
         if not text:
             return jsonify({
@@ -792,6 +821,7 @@ def delete_document(filename):
         connection.close()
 
         documents.pop(index_key, None)
+        extracted_text_cache.pop(index_key, None)
 
         return jsonify({
             "message": "Document deleted successfully",
