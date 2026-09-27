@@ -1,4 +1,4 @@
-const API_BASE_URL = "http://127.0.0.1:5000";
+const API_BASE_URL = "https://industrybrain-ai.onrender.com";
 
 const getAuthHeaders = () => {
   const token = localStorage.getItem("industrybrain_token");
