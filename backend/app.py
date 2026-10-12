@@ -357,91 +357,137 @@ def document_index_key(user_id, filename):
 # --------------------------------------------------
 
 def is_text_usable(text):
-    """Basic heuristic to identify pages with usable extracted text."""
+    """Return True when extracted text is substantial enough to use directly."""
     if not text or len(text.strip()) < 20:
         return False
 
     stripped = text.strip()
     alphanumeric = sum(char.isalnum() for char in stripped)
     ratio = alphanumeric / max(len(stripped), 1)
-
     return ratio >= 0.45
 
 
+def _native_text_is_good_enough(text):
+    """Avoid expensive OCR when a PDF page already has meaningful native text."""
+    if is_text_usable(text):
+        return True
+
+    stripped = (text or "").strip()
+    if len(stripped) < 80:
+        return False
+
+    alphanumeric = sum(char.isalnum() for char in stripped)
+    ratio = alphanumeric / max(len(stripped), 1)
+    # A less strict fallback prevents OCR timeouts on text-based PDFs whose
+    # extracted layout or punctuation makes the strict quality check fail.
+    return ratio >= 0.30
+
+
 def extract_text_from_file(file_path):
-    """
-    Extract PDF, DOCX, or TXT text.
+    """Extract PDF, DOCX, or TXT text, using OCR only when it is needed.
 
-    For PDFs, native text is extracted page by page. OCR is used only
-    on pages where native text is absent or appears unusable.
+    PDF pages with useful native text skip OCR. OCR is reserved for pages
+    with no text or very little/low-quality text and has a short timeout so
+    one difficult page cannot hold up the whole document for 30 seconds.
     """
-
     extension = os.path.splitext(file_path)[1].lower()
-
-    # --------------------------------------------------
-    # PDF
-    # --------------------------------------------------
 
     if extension == ".pdf":
         extracted_pages = []
+        file_name = os.path.basename(file_path)
+        total_ocr_pages = 0
+        total_ocr_timeouts = 0
 
         with fitz.open(file_path) as pdf:
             page_count = len(pdf)
             app.logger.info(
                 "[EXTRACTION] Starting PDF extraction: %s pages, %s",
                 page_count,
-                os.path.basename(file_path),
+                file_name,
             )
 
             for page_number, page in enumerate(pdf, start=1):
-                page_text = page.get_text("text").strip()
+                page_started = time.perf_counter()
+                page_text = page.get_text("text", sort=True).strip()
 
-                if is_text_usable(page_text):
+                if _native_text_is_good_enough(page_text):
                     extracted_pages.append(page_text)
+                    app.logger.debug(
+                        "[EXTRACTION] Page %s used native text (%s chars)",
+                        page_number,
+                        len(page_text),
+                    )
                     continue
 
-                # OCR only the page that needs it.
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(1.5, 1.5),
-                    alpha=False,
-                )
-
-                image = Image.frombytes(
-                    "RGB",
-                    [pix.width, pix.height],
-                    pix.samples,
-                )
-                image = ImageOps.grayscale(image)
-                image = ImageOps.autocontrast(image)
+                # If a page has a small amount of native text, preserve it as
+                # a fallback in case OCR is slow or cannot recognize the page.
+                fallback_text = page_text
+                total_ocr_pages += 1
 
                 try:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(1.2, 1.2),
+                        alpha=False,
+                        colorspace=fitz.csRGB,
+                    )
+                    image = Image.frombytes(
+                        "RGB",
+                        (pix.width, pix.height),
+                        pix.samples,
+                    )
+                    image = ImageOps.autocontrast(ImageOps.grayscale(image))
+
                     ocr_text = pytesseract.image_to_string(
                         image,
                         lang="eng",
                         config="--oem 1 --psm 3",
-                        timeout=30,
+                        timeout=6,
                     ).strip()
+
+                    if is_text_usable(ocr_text):
+                        extracted_pages.append(ocr_text)
+                    elif fallback_text:
+                        extracted_pages.append(fallback_text)
+                    elif ocr_text:
+                        extracted_pages.append(ocr_text)
+
                 except RuntimeError:
+                    total_ocr_timeouts += 1
                     app.logger.warning(
-                        "[OCR] Timed out on page %s of %s",
+                        "[OCR] Timed out after 6 seconds on page %s of %s; "
+                        "keeping native text if available",
                         page_number,
-                        os.path.basename(file_path),
+                        file_name,
                     )
-                    ocr_text = ""
+                    if fallback_text:
+                        extracted_pages.append(fallback_text)
 
-                if is_text_usable(ocr_text):
-                    extracted_pages.append(ocr_text)
-                elif page_text:
-                    # Keep whatever native text is available as fallback.
-                    extracted_pages.append(page_text)
-                elif ocr_text:
-                    extracted_pages.append(ocr_text)
+                except Exception:
+                    app.logger.exception(
+                        "[OCR] Failed on page %s of %s; "
+                        "keeping native text if available",
+                        page_number,
+                        file_name,
+                    )
+                    if fallback_text:
+                        extracted_pages.append(fallback_text)
 
-        return "\n\n".join(extracted_pages).strip()
+                finally:
+                    app.logger.debug(
+                        "[TIMING] PDF page %s processed in %.2f seconds",
+                        page_number,
+                        time.perf_counter() - page_started,
+                    )
 
-    # --------------------------------------------------
-    # DOCX
-    # --------------------------------------------------
+        result = "\n\n".join(text for text in extracted_pages if text).strip()
+        app.logger.info(
+            "[EXTRACTION] Finished %s: chars=%s, OCR pages=%s, OCR timeouts=%s",
+            file_name,
+            len(result),
+            total_ocr_pages,
+            total_ocr_timeouts,
+        )
+        return result
 
     if extension == ".docx":
         document = Document(file_path)
@@ -451,10 +497,6 @@ def extract_text_from_file(file_path):
             if paragraph.text.strip()
         ]
         return "\n".join(paragraphs).strip()
-
-    # --------------------------------------------------
-    # TXT
-    # --------------------------------------------------
 
     if extension == ".txt":
         with open(
