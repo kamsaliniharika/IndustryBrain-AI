@@ -1,11 +1,12 @@
 import os
 import sqlite3
 import secrets
-
+import time
 from functools import wraps
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -14,17 +15,30 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 import fitz
 from docx import Document
-
 import pytesseract
-from PIL import Image
-
-from google.genai import types
+from PIL import Image, ImageOps
 import faiss
 import numpy as np
 
 
+# --------------------------------------------------
+# App Setup
+# --------------------------------------------------
+
 app = Flask(__name__)
 CORS(app)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+DATABASE = os.path.join(BASE_DIR, "users.db")
+
+ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 # --------------------------------------------------
@@ -40,113 +54,82 @@ else:
 
 
 # --------------------------------------------------
-# Configuration
+# Gemini Configuration
 # --------------------------------------------------
 
 load_dotenv()
 
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-gemini_client = genai.Client(
-    api_key=gemini_api_key
-)
+if not GEMINI_API_KEY:
+    print(
+        "[WARNING] GEMINI_API_KEY is not set. "
+        "Upload and text extraction can work, but embedding and AI "
+        "answer generation will fail until the key is configured."
+    )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-
-ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
-
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-
-# --------------------------------------------------
-# Gemini Embedding Configuration
-# --------------------------------------------------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 768
 EMBEDDING_BATCH_SIZE = 32
-
-
-def create_embeddings(texts, task_type="RETRIEVAL_DOCUMENT"):
-    """
-    Create embeddings with Gemini instead of loading a local
-    SentenceTransformer/PyTorch model.
-    """
-    if isinstance(texts, str):
-        texts = [texts]
-
-    if not texts:
-        return np.empty((0, EMBEDDING_DIMENSION), dtype="float32")
-
-    all_embeddings = []
-
-    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
-
-        result = gemini_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=EMBEDDING_DIMENSION,
-            ),
-        )
-
-        all_embeddings.extend(
-            embedding.values for embedding in result.embeddings
-        )
-
-    return np.asarray(all_embeddings, dtype="float32")
+ANSWER_MODEL = "gemini-2.5-flash"
 
 
 # --------------------------------------------------
-# In-Memory Semantic Search Storage
+# In-Memory Index and Extraction Cache
 # --------------------------------------------------
+# Render instances can restart, so these caches are temporary.
+# A document will be re-indexed when needed after a restart.
 
 documents = {}
-
-# Cache extracted text so /index does not run OCR a second time
-# immediately after /extract for the same user/document.
 extracted_text_cache = {}
 
+
 # --------------------------------------------------
-# Authentication Database
+# Database Setup
 # --------------------------------------------------
-DATABASE = os.path.join(BASE_DIR, "users.db")
 
 def init_auth_db():
     connection = sqlite3.connect(DATABASE)
-    cursor = connection.cursor()
+    try:
+        cursor = connection.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            token TEXT UNIQUE
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                token TEXT UNIQUE
+            )
+            """
         )
-    """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            filename TEXT NOT NULL,
-            UNIQUE(user_id, filename),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                UNIQUE(user_id, filename),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
         )
-    """)
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+    finally:
+        connection.close()
+
 
 init_auth_db()
+
+
+# --------------------------------------------------
+# Authentication Helpers
+# --------------------------------------------------
 
 def get_auth_token():
     auth_header = request.headers.get("Authorization", "")
@@ -154,18 +137,28 @@ def get_auth_token():
         return None
     return auth_header.replace("Bearer ", "", 1).strip()
 
+
 def get_current_user():
     token = get_auth_token()
     if not token:
         return None
+
     connection = sqlite3.connect(DATABASE)
-    cursor = connection.cursor()
-    cursor.execute("SELECT id, name, email FROM users WHERE token = ?", (token,))
-    user = cursor.fetchone()
-    connection.close()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT id, name, email FROM users WHERE token = ?",
+            (token,),
+        )
+        user = cursor.fetchone()
+    finally:
+        connection.close()
+
     if not user:
         return None
+
     return {"id": user[0], "name": user[1], "email": user[2]}
+
 
 def login_required(function):
     @wraps(function)
@@ -176,203 +169,301 @@ def login_required(function):
         return function(*args, **kwargs)
     return wrapper
 
+
 # --------------------------------------------------
-# Authentication
+# Authentication Routes
 # --------------------------------------------------
+
 @app.route("/signup", methods=["POST"])
 def signup():
     data = request.get_json(silent=True) or {}
-    name = data.get("name", "").strip()
-    email = data.get("email", "").strip().lower()
+
+    name = str(data.get("name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
+
     if not name or not email or not password:
-        return jsonify({"error": "Name, email and password are required"}), 400
-    if len(password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
+        return jsonify(
+            {"error": "Name, email and password are required"}
+        ), 400
+
+    if not isinstance(password, str) or len(password) < 6:
+        return jsonify(
+            {"error": "Password must be at least 6 characters"}
+        ), 400
+
     hashed_password = generate_password_hash(password)
     connection = sqlite3.connect(DATABASE)
-    cursor = connection.cursor()
+
     try:
-        cursor.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)", (name, email, hashed_password))
-        # Generate a token immediately so signup also creates an authenticated session.
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO users (name, email, password)
+            VALUES (?, ?, ?)
+            """,
+            (name, email, hashed_password),
+        )
+
+        user_id = cursor.lastrowid
         token = secrets.token_urlsafe(32)
-        cursor.execute("UPDATE users SET token = ? WHERE id = ?", (token, cursor.lastrowid))
+
+        cursor.execute(
+            "UPDATE users SET token = ? WHERE id = ?",
+            (token, user_id),
+        )
         connection.commit()
 
-        return jsonify({
-            "message": "Account created successfully",
-            "token": token,
-            "user": {
-                "id": cursor.lastrowid,
-                "name": name,
-                "email": email
+        return jsonify(
+            {
+                "message": "Account created successfully",
+                "token": token,
+                "user": {
+                    "id": user_id,
+                    "name": name,
+                    "email": email,
+                },
             }
-        }), 201
+        ), 201
+
     except sqlite3.IntegrityError:
-        return jsonify({"error": "An account with this email already exists"}), 409
-    except Exception as error:
-        return jsonify({"error": f"Signup failed: {str(error)}"}), 500
+        return jsonify(
+            {"error": "An account with this email already exists"}
+        ), 409
+
+    except Exception:
+        app.logger.exception("Signup failed")
+        return jsonify({"error": "Signup failed. Please try again."}), 500
+
     finally:
         connection.close()
+
 
 @app.route("/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
-    email = data.get("email", "").strip().lower()
+
+    email = str(data.get("email", "")).strip().lower()
     password = data.get("password", "")
+
     if not email or not password:
-        return jsonify({"error": "Email and password are required"}), 400
+        return jsonify(
+            {"error": "Email and password are required"}
+        ), 400
+
     connection = sqlite3.connect(DATABASE)
-    cursor = connection.cursor()
-    cursor.execute("SELECT id, name, email, password FROM users WHERE email = ?", (email,))
-    user = cursor.fetchone()
-    if not user or not check_password_hash(user[3], password):
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, name, email, password
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        )
+        user = cursor.fetchone()
+
+        if not user or not check_password_hash(user[3], password):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        token = secrets.token_urlsafe(32)
+        cursor.execute(
+            "UPDATE users SET token = ? WHERE id = ?",
+            (token, user[0]),
+        )
+        connection.commit()
+
+        return jsonify(
+            {
+                "message": "Login successful",
+                "token": token,
+                "user": {
+                    "id": user[0],
+                    "name": user[1],
+                    "email": user[2],
+                },
+            }
+        )
+    finally:
         connection.close()
-        return jsonify({"error": "Invalid email or password"}), 401
-    token = secrets.token_urlsafe(32)
-    cursor.execute("UPDATE users SET token = ? WHERE id = ?", (token, user[0]))
-    connection.commit()
-    connection.close()
-    return jsonify({"message": "Login successful", "token": token, "user": {"id": user[0], "name": user[1], "email": user[2]}})
+
 
 @app.route("/me", methods=["GET"])
 @login_required
 def current_user():
     return jsonify({"user": get_current_user()})
 
+
 @app.route("/logout", methods=["POST"])
 def logout():
     token = get_auth_token()
+
     if token:
         connection = sqlite3.connect(DATABASE)
-        cursor = connection.cursor()
-        cursor.execute("UPDATE users SET token = NULL WHERE token = ?", (token,))
-        connection.commit()
-        connection.close()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                "UPDATE users SET token = NULL WHERE token = ?",
+                (token,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     return jsonify({"message": "Logged out successfully"})
 
 
 # --------------------------------------------------
-# Helper Functions
+# General Helpers
 # --------------------------------------------------
 
 def allowed_file(filename):
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower()
-        in ALLOWED_EXTENSIONS
+        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
     )
 
 
+def get_user_document_path(user_id, filename):
+    safe_filename = secure_filename(filename)
+    stored_filename = f"{user_id}_{safe_filename}"
+    return os.path.join(app.config["UPLOAD_FOLDER"], stored_filename)
+
+
+def user_owns_document(user_id, filename):
+    connection = sqlite3.connect(DATABASE)
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM user_documents
+            WHERE user_id = ? AND filename = ?
+            """,
+            (user_id, secure_filename(filename)),
+        )
+        return cursor.fetchone() is not None
+    finally:
+        connection.close()
+
+
+def document_index_key(user_id, filename):
+    return f"{user_id}:{secure_filename(filename)}"
+
+
 # --------------------------------------------------
-# Document Text Extraction
+# Text Quality Check and Document Extraction
 # --------------------------------------------------
+
+def is_text_usable(text):
+    """Basic heuristic to identify pages with usable extracted text."""
+    if not text or len(text.strip()) < 20:
+        return False
+
+    stripped = text.strip()
+    alphanumeric = sum(char.isalnum() for char in stripped)
+    ratio = alphanumeric / max(len(stripped), 1)
+
+    return ratio >= 0.45
+
 
 def extract_text_from_file(file_path):
+    """
+    Extract PDF, DOCX, or TXT text.
 
-    extension = file_path.rsplit(".", 1)[1].lower()
+    For PDFs, native text is extracted page by page. OCR is used only
+    on pages where native text is absent or appears unusable.
+    """
 
+    extension = os.path.splitext(file_path)[1].lower()
 
     # --------------------------------------------------
     # PDF
     # --------------------------------------------------
 
-    if extension == "pdf":
+    if extension == ".pdf":
+        extracted_pages = []
 
-        document = fitz.open(file_path)
+        with fitz.open(file_path) as pdf:
+            page_count = len(pdf)
+            app.logger.info(
+                "[EXTRACTION] Starting PDF extraction: %s pages, %s",
+                page_count,
+                os.path.basename(file_path),
+            )
 
-        text = []
+            for page_number, page in enumerate(pdf, start=1):
+                page_text = page.get_text("text").strip()
 
-        # Normal PDF text extraction
-        for page in document:
+                if is_text_usable(page_text):
+                    extracted_pages.append(page_text)
+                    continue
 
-            page_text = page.get_text()
-
-            if page_text.strip():
-                text.append(page_text)
-
-        extracted_text = "\n".join(text).strip()
-
-
-        # OCR fallback for scanned PDFs
-        if not extracted_text:
-            ocr_text = []
-
-            for page in document:
-                # 1x rendering is much faster and uses less memory than 2x.
+                # OCR only the page that needs it.
                 pix = page.get_pixmap(
-                    matrix=fitz.Matrix(1, 1),
-                    alpha=False
+                    matrix=fitz.Matrix(1.5, 1.5),
+                    alpha=False,
                 )
-
-                # Keep very large pages from creating unnecessarily huge OCR images.
-                max_dimension = 1800
-                scale = min(
-                    1.0,
-                    max_dimension / max(pix.width, pix.height)
-                )
-
-                if scale < 1.0:
-                    pix = page.get_pixmap(
-                        matrix=fitz.Matrix(scale, scale),
-                        alpha=False
-                    )
 
                 image = Image.frombytes(
                     "RGB",
                     [pix.width, pix.height],
-                    pix.samples
+                    pix.samples,
                 )
+                image = ImageOps.grayscale(image)
+                image = ImageOps.autocontrast(image)
 
-                page_ocr = pytesseract.image_to_string(
-                    image,
-                    lang="eng",
-                    config="--psm 6"
-                )
+                try:
+                    ocr_text = pytesseract.image_to_string(
+                        image,
+                        lang="eng",
+                        config="--oem 1 --psm 3",
+                        timeout=30,
+                    ).strip()
+                except RuntimeError:
+                    app.logger.warning(
+                        "[OCR] Timed out on page %s of %s",
+                        page_number,
+                        os.path.basename(file_path),
+                    )
+                    ocr_text = ""
 
-                if page_ocr.strip():
-                    ocr_text.append(page_ocr)
+                if is_text_usable(ocr_text):
+                    extracted_pages.append(ocr_text)
+                elif page_text:
+                    # Keep whatever native text is available as fallback.
+                    extracted_pages.append(page_text)
+                elif ocr_text:
+                    extracted_pages.append(ocr_text)
 
-            extracted_text = "\n".join(ocr_text).strip()
-
-        document.close()
-
-        return extracted_text
-
+        return "\n\n".join(extracted_pages).strip()
 
     # --------------------------------------------------
     # DOCX
     # --------------------------------------------------
 
-    elif extension == "docx":
-
+    if extension == ".docx":
         document = Document(file_path)
-
-        text = []
-
-        for paragraph in document.paragraphs:
-
-            if paragraph.text.strip():
-                text.append(paragraph.text)
-
-        return "\n".join(text).strip()
-
+        paragraphs = [
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+        ]
+        return "\n".join(paragraphs).strip()
 
     # --------------------------------------------------
     # TXT
     # --------------------------------------------------
 
-    elif extension == "txt":
-
+    if extension == ".txt":
         with open(
             file_path,
             "r",
             encoding="utf-8",
-            errors="ignore"
+            errors="ignore",
         ) as file:
-
             return file.read().strip()
-
 
     return ""
 
@@ -382,80 +473,142 @@ def extract_text_from_file(file_path):
 # --------------------------------------------------
 
 def create_chunks(text, chunk_size=500, overlap=100):
-
+    """Split extracted text into overlapping word chunks."""
     words = text.split()
 
+    if not words:
+        return []
+
+    step = max(1, chunk_size - overlap)
     chunks = []
 
-    start = 0
-
-    while start < len(words):
-
-        end = start + chunk_size
-
-        chunk = " ".join(words[start:end])
-
-        if chunk.strip():
+    for start in range(0, len(words), step):
+        chunk = " ".join(words[start:start + chunk_size]).strip()
+        if chunk:
             chunks.append(chunk)
-
-        start += chunk_size - overlap
 
     return chunks
 
 
 # --------------------------------------------------
-# Create FAISS Index
+# Gemini Embeddings
 # --------------------------------------------------
 
-def create_faiss_index(filename, chunks):
+def create_embeddings(texts, task_type="RETRIEVAL_DOCUMENT"):
+    """
+    Create embeddings in batches to reduce the number of API requests.
+    """
+    if isinstance(texts, str):
+        texts = [texts]
 
+    if not texts:
+        return np.empty((0, EMBEDDING_DIMENSION), dtype="float32")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured in the backend environment."
+        )
+
+    all_embeddings = []
+    total_start = time.perf_counter()
+
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+        batch_start = time.perf_counter()
+
+        result = gemini_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=EMBEDDING_DIMENSION,
+            ),
+        )
+
+        batch_embeddings = [
+            embedding.values for embedding in result.embeddings
+        ]
+
+        if len(batch_embeddings) != len(batch):
+            raise RuntimeError(
+                "Gemini returned a different number of embeddings "
+                "than the number of input texts."
+            )
+
+        all_embeddings.extend(batch_embeddings)
+
+        app.logger.info(
+            "[TIMING] Embedding batch: %s texts in %.2f seconds",
+            len(batch),
+            time.perf_counter() - batch_start,
+        )
+
+    app.logger.info(
+        "[TIMING] Total embedding time: %.2f seconds for %s texts",
+        time.perf_counter() - total_start,
+        len(texts),
+    )
+
+    return np.asarray(all_embeddings, dtype="float32")
+
+
+# --------------------------------------------------
+# FAISS Index Creation
+# --------------------------------------------------
+
+def create_faiss_index(index_key, chunks):
+    """Create a FAISS index unless a current index already exists."""
     if not chunks:
-        return
+        raise ValueError("No text chunks were created from this document.")
 
-    print(f"Creating embeddings for {filename}...")
+    if index_key in documents:
+        app.logger.info("[INDEX] Reusing existing index: %s", index_key)
+        return documents[index_key]
+
+    started = time.perf_counter()
+    app.logger.info(
+        "[INDEX] Creating embeddings for %s chunks",
+        len(chunks),
+    )
 
     embeddings = create_embeddings(
         chunks,
-        task_type="RETRIEVAL_DOCUMENT"
+        task_type="RETRIEVAL_DOCUMENT",
     )
 
-    dimension = embeddings.shape[1]
+    if embeddings.size == 0:
+        raise ValueError("Could not create embeddings for this document.")
 
-    index = faiss.IndexFlatL2(dimension)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 
-    documents[filename] = {
+    indexed_document = {
         "chunks": chunks,
-        "index": index
+        "index": index,
     }
+    documents[index_key] = indexed_document
 
-    print(
-        f"FAISS index created for {filename} "
-        f"with {len(chunks)} chunks."
+    app.logger.info(
+        "[TIMING] Index creation finished in %.2f seconds; chunks=%s",
+        time.perf_counter() - started,
+        len(chunks),
     )
 
+    return indexed_document
+
+
 # --------------------------------------------------
-# Home
+# Home and Health
 # --------------------------------------------------
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-
-    return jsonify({
-        "message": "IndustryBrain AI Backend is running!"
-    })
+    return jsonify({"message": "IndustryBrain AI Backend is running!"})
 
 
-# --------------------------------------------------
-# Health Check
-# --------------------------------------------------
-
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
-
-    return jsonify({
-        "status": "ok"
-    })
+    return jsonify({"status": "ok"})
 
 
 # --------------------------------------------------
@@ -465,97 +618,67 @@ def health():
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload_file():
-
     user = get_current_user()
 
     if "file" not in request.files:
-        return jsonify({
-            "error": "No file provided"
-        }), 400
+        return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
 
-    if file.filename == "":
-        return jsonify({
-            "error": "No file selected"
-        }), 400
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
 
     if not allowed_file(file.filename):
-        return jsonify({
-            "error": "Only PDF, DOCX, and TXT files are allowed"
-        }), 400
+        return jsonify(
+            {"error": "Only PDF, DOCX, and TXT files are allowed"}
+        ), 400
 
-    # Original filename shown to the user
     original_filename = secure_filename(file.filename)
 
-    # User-specific physical filename
-    stored_filename = f"{user['id']}_{original_filename}"
+    if not original_filename:
+        return jsonify({"error": "Invalid filename"}), 400
 
+    stored_filename = f"{user['id']}_{original_filename}"
     file_path = os.path.join(
         app.config["UPLOAD_FOLDER"],
-        stored_filename
+        stored_filename,
     )
 
     try:
         file.save(file_path)
 
         connection = sqlite3.connect(DATABASE)
-        cursor = connection.cursor()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO user_documents (user_id, filename)
+                VALUES (?, ?)
+                """,
+                (user["id"], original_filename),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO user_documents
-            (user_id, filename)
-            VALUES (?, ?)
-            """,
-            (user["id"], original_filename)
-        )
+        # If a document with the same name was replaced, discard its old
+        # in-memory index and extracted text.
+        index_key = document_index_key(user["id"], original_filename)
+        documents.pop(index_key, None)
+        extracted_text_cache.pop(index_key, None)
 
-        connection.commit()
-        connection.close()
+        return jsonify(
+            {
+                "message": "File uploaded successfully",
+                "filename": original_filename,
+            }
+        ), 201
 
-        return jsonify({
-            "message": "File uploaded successfully",
-            "filename": original_filename
-        }), 201
-
-    except Exception as error:
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-        return jsonify({
-            "error": f"File upload failed: {str(error)}"
-        }), 500
-
-
-# --------------------------------------------------
-# User Document Helpers
-# --------------------------------------------------
-
-def get_user_document_path(user_id, filename):
-    """Return the physical path for a user's uploaded document."""
-    safe_filename = secure_filename(filename)
-    stored_filename = f"{user_id}_{safe_filename}"
-    return os.path.join(app.config["UPLOAD_FOLDER"], stored_filename)
-
-
-def user_owns_document(user_id, filename):
-    """Check whether the logged-in user owns the document."""
-    connection = sqlite3.connect(DATABASE)
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT 1 FROM user_documents WHERE user_id = ? AND filename = ?",
-        (user_id, secure_filename(filename))
-    )
-    result = cursor.fetchone()
-    connection.close()
-    return result is not None
-
-
-def document_index_key(user_id, filename):
-    """Create a unique in-memory FAISS key per user and document."""
-    return f"{user_id}:{secure_filename(filename)}"
+    except Exception:
+        app.logger.exception("File upload failed")
+        return jsonify(
+            {"error": "File upload failed. Please try again."}
+        ), 500
 
 
 # --------------------------------------------------
@@ -565,39 +688,54 @@ def document_index_key(user_id, filename):
 @app.route("/extract/<filename>", methods=["GET"])
 @login_required
 def extract_document(filename):
-
     user = get_current_user()
     filename = secure_filename(filename)
 
     if not user_owns_document(user["id"], filename):
-        return jsonify({
-            "error": "Document not found or not accessible"
-        }), 404
+        return jsonify(
+            {"error": "Document not found or not accessible"}
+        ), 404
 
     file_path = get_user_document_path(user["id"], filename)
 
-    if not os.path.exists(file_path):
-        return jsonify({
-            "error": "File not found"
-        }), 404
+    if not os.path.isfile(file_path):
+        return jsonify({"error": "File not found"}), 404
+
+    index_key = document_index_key(user["id"], filename)
 
     try:
-        text = extract_text_from_file(file_path)
+        started = time.perf_counter()
 
-        # Reuse this text during the following /index request.
-        index_key = document_index_key(user["id"], filename)
-        extracted_text_cache[index_key] = text
+        # Reuse cached text for repeat requests during this process.
+        text = extracted_text_cache.get(index_key)
 
-        return jsonify({
-            "filename": filename,
-            "text": text,
-            "characters": len(text)
-        })
+        if text is None:
+            text = extract_text_from_file(file_path)
+            extracted_text_cache[index_key] = text
 
-    except Exception as error:
-        return jsonify({
-            "error": f"Could not extract document text: {str(error)}"
-        }), 500
+        elapsed = time.perf_counter() - started
+
+        app.logger.info(
+            "[TIMING] Extraction endpoint: %.2f seconds | "
+            "file=%s | characters=%s",
+            elapsed,
+            filename,
+            len(text),
+        )
+
+        return jsonify(
+            {
+                "filename": filename,
+                "text": text,
+                "characters": len(text),
+            }
+        )
+
+    except Exception:
+        app.logger.exception("Document extraction failed: %s", filename)
+        return jsonify(
+            {"error": "Could not extract document text. Check backend logs."}
+        ), 500
 
 
 # --------------------------------------------------
@@ -607,51 +745,88 @@ def extract_document(filename):
 @app.route("/index/<filename>", methods=["POST"])
 @login_required
 def index_document(filename):
-
     user = get_current_user()
     filename = secure_filename(filename)
 
     if not user_owns_document(user["id"], filename):
-        return jsonify({
-            "error": "Document not found or not accessible"
-        }), 404
+        return jsonify(
+            {"error": "Document not found or not accessible"}
+        ), 404
 
     file_path = get_user_document_path(user["id"], filename)
 
-    if not os.path.exists(file_path):
-        return jsonify({
-            "error": "File not found"
-        }), 404
+    if not os.path.isfile(file_path):
+        return jsonify({"error": "File not found"}), 404
+
+    index_key = document_index_key(user["id"], filename)
 
     try:
-        index_key = document_index_key(user["id"], filename)
+        started = time.perf_counter()
 
-        # Reuse /extract output instead of running OCR a second time.
+        # Avoid rebuilding the same index repeatedly.
+        if index_key in documents:
+            existing = documents[index_key]
+            return jsonify(
+                {
+                    "message": "Document already indexed",
+                    "filename": filename,
+                    "chunks": len(existing["chunks"]),
+                    "already_indexed": True,
+                }
+            )
+
+        # Reuse extracted text when /extract was just called.
         text = extracted_text_cache.get(index_key)
 
         if text is None:
+            extraction_started = time.perf_counter()
             text = extract_text_from_file(file_path)
             extracted_text_cache[index_key] = text
 
-        if not text:
-            return jsonify({
-                "error": "No text found in document"
-            }), 400
+            app.logger.info(
+                "[TIMING] Extraction during indexing: %.2f seconds | "
+                "file=%s | characters=%s",
+                time.perf_counter() - extraction_started,
+                filename,
+                len(text),
+            )
 
+        if not text.strip():
+            return jsonify(
+                {"error": "No readable text found in this document"}
+            ), 400
+
+        chunk_started = time.perf_counter()
         chunks = create_chunks(text)
-        index_key = document_index_key(user["id"], filename)
+
+        app.logger.info(
+            "[TIMING] Chunking: %.2f seconds | chunks=%s",
+            time.perf_counter() - chunk_started,
+            len(chunks),
+        )
+
         create_faiss_index(index_key, chunks)
 
-        return jsonify({
-            "message": "Document indexed successfully",
-            "filename": filename,
-            "chunks": len(chunks)
-        })
+        app.logger.info(
+            "[TIMING] Total /index request: %.2f seconds | file=%s",
+            time.perf_counter() - started,
+            filename,
+        )
 
-    except Exception as error:
-        return jsonify({
-            "error": f"Could not index document: {str(error)}"
-        }), 500
+        return jsonify(
+            {
+                "message": "Document indexed successfully",
+                "filename": filename,
+                "chunks": len(chunks),
+                "already_indexed": False,
+            }
+        )
+
+    except Exception:
+        app.logger.exception("Document indexing failed: %s", filename)
+        return jsonify(
+            {"error": "Could not index document. Check backend logs."}
+        ), 500
 
 
 # --------------------------------------------------
@@ -661,89 +836,110 @@ def index_document(filename):
 @app.route("/search", methods=["POST"])
 @login_required
 def semantic_search():
-
     user = get_current_user()
     data = request.get_json(silent=True) or {}
 
-    query = data.get("query", "").strip()
-    filename = secure_filename(data.get("filename", "").strip())
+    query = str(data.get("query", "")).strip()
+    filename = secure_filename(str(data.get("filename", "")).strip())
 
     if not query:
-        return jsonify({
-            "error": "Search query is required"
-        }), 400
+        return jsonify({"error": "Search query is required"}), 400
 
     if not filename:
-        return jsonify({
-            "error": "Filename is required"
-        }), 400
+        return jsonify({"error": "Filename is required"}), 400
 
     if not user_owns_document(user["id"], filename):
-        return jsonify({
-            "error": "Document not found or not accessible"
-        }), 404
+        return jsonify(
+            {"error": "Document not found or not accessible"}
+        ), 404
 
     index_key = document_index_key(user["id"], filename)
 
     if index_key not in documents:
-        return jsonify({
-            "error": "This document has not been indexed yet"
-        }), 400
+        return jsonify(
+            {
+                "error": (
+                    "This document is not indexed in the current backend "
+                    "session. Please analyze the document again."
+                )
+            }
+        ), 400
 
     try:
-        document = documents[index_key]
-        index = document["index"]
-        chunks = document["chunks"]
+        started = time.perf_counter()
+        indexed_document = documents[index_key]
+        index = indexed_document["index"]
+        chunks = indexed_document["chunks"]
 
         query_embedding = create_embeddings(
             [query],
-            task_type="RETRIEVAL_QUERY"
+            task_type="RETRIEVAL_QUERY",
         )
 
         distances, indices = index.search(
             query_embedding,
-            min(5, len(chunks))
+            min(5, len(chunks)),
         )
 
         results = []
         for distance, chunk_index in zip(distances[0], indices[0]):
             if chunk_index >= 0:
-                results.append({
-                    "text": chunks[chunk_index],
-                    "distance": float(distance)
-                })
+                results.append(
+                    {
+                        "text": chunks[chunk_index],
+                        "distance": float(distance),
+                    }
+                )
 
-        return jsonify({
-            "query": query,
-            "filename": filename,
-            "results": results
-        })
+        app.logger.info(
+            "[TIMING] Search request: %.2f seconds",
+            time.perf_counter() - started,
+        )
 
-    except Exception as error:
-        return jsonify({
-            "error": f"Search failed: {str(error)}"
-        }), 500
+        return jsonify(
+            {
+                "query": query,
+                "filename": filename,
+                "results": results,
+            }
+        )
+
+    except Exception:
+        app.logger.exception("Semantic search failed")
+        return jsonify(
+            {"error": "Search failed. Check backend logs."}
+        ), 500
 
 
 # --------------------------------------------------
 # Get Uploaded Documents
 # --------------------------------------------------
+# IMPORTANT PERFORMANCE CHANGE:
+# This endpoint only lists documents. It does not extract text or
+# generate embeddings for every document when the documents page opens.
+# Indexing happens through POST /index/<filename> when requested.
 
 @app.route("/documents", methods=["GET"])
 @login_required
 def get_documents():
-
     user = get_current_user()
 
     try:
         connection = sqlite3.connect(DATABASE)
-        cursor = connection.cursor()
-        cursor.execute(
-            "SELECT filename FROM user_documents WHERE user_id = ? ORDER BY id DESC",
-            (user["id"],)
-        )
-        user_filenames = [row[0] for row in cursor.fetchall()]
-        connection.close()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT filename
+                FROM user_documents
+                WHERE user_id = ?
+                ORDER BY id DESC
+                """,
+                (user["id"],),
+            )
+            user_filenames = [row[0] for row in cursor.fetchall()]
+        finally:
+            connection.close()
 
         document_list = []
 
@@ -754,38 +950,28 @@ def get_documents():
                 continue
 
             index_key = document_index_key(user["id"], filename)
+            indexed_document = documents.get(index_key)
 
-            # Automatically create index if it is not in memory.
-            if index_key not in documents:
-                try:
-                    text = extract_text_from_file(file_path)
-                    if text.strip():
-                        chunks = create_chunks(text)
-                        create_faiss_index(index_key, chunks)
-                except Exception as index_error:
-                    print(
-                        f"Could not index {filename}: {index_error}"
-                    )
+            document_list.append(
+                {
+                    "filename": filename,
+                    "size": os.path.getsize(file_path),
+                    "indexed": indexed_document is not None,
+                    "chunks": (
+                        len(indexed_document["chunks"])
+                        if indexed_document is not None
+                        else 0
+                    ),
+                }
+            )
 
-            document_list.append({
-                "filename": filename,
-                "size": os.path.getsize(file_path),
-                "indexed": index_key in documents,
-                "chunks": (
-                    len(documents[index_key]["chunks"])
-                    if index_key in documents
-                    else 0
-                )
-            })
+        return jsonify({"documents": document_list})
 
-        return jsonify({
-            "documents": document_list
-        })
-
-    except Exception as error:
-        return jsonify({
-            "error": f"Failed to get documents: {str(error)}"
-        }), 500
+    except Exception:
+        app.logger.exception("Failed to list documents")
+        return jsonify(
+            {"error": "Failed to load documents. Check backend logs."}
+        ), 500
 
 
 # --------------------------------------------------
@@ -795,14 +981,13 @@ def get_documents():
 @app.route("/documents/<filename>", methods=["DELETE"])
 @login_required
 def delete_document(filename):
-
     user = get_current_user()
     filename = secure_filename(filename)
 
     if not user_owns_document(user["id"], filename):
-        return jsonify({
-            "error": "Document not found or not accessible"
-        }), 404
+        return jsonify(
+            {"error": "Document not found or not accessible"}
+        ), 404
 
     file_path = get_user_document_path(user["id"], filename)
     index_key = document_index_key(user["id"], filename)
@@ -812,26 +997,34 @@ def delete_document(filename):
             os.remove(file_path)
 
         connection = sqlite3.connect(DATABASE)
-        cursor = connection.cursor()
-        cursor.execute(
-            "DELETE FROM user_documents WHERE user_id = ? AND filename = ?",
-            (user["id"], filename)
-        )
-        connection.commit()
-        connection.close()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                DELETE FROM user_documents
+                WHERE user_id = ? AND filename = ?
+                """,
+                (user["id"], filename),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
         documents.pop(index_key, None)
         extracted_text_cache.pop(index_key, None)
 
-        return jsonify({
-            "message": "Document deleted successfully",
-            "filename": filename
-        })
+        return jsonify(
+            {
+                "message": "Document deleted successfully",
+                "filename": filename,
+            }
+        )
 
-    except Exception as error:
-        return jsonify({
-            "error": f"Document deletion failed: {str(error)}"
-        }), 500
+    except Exception:
+        app.logger.exception("Document deletion failed: %s", filename)
+        return jsonify(
+            {"error": "Document deletion failed. Check backend logs."}
+        ), 500
 
 
 # --------------------------------------------------
@@ -841,63 +1034,68 @@ def delete_document(filename):
 @app.route("/ask", methods=["POST"])
 @login_required
 def ask_gemini():
-
     user = get_current_user()
     data = request.get_json(silent=True) or {}
 
-    query = data.get("query", "").strip()
-    filename = secure_filename(data.get("filename", "").strip())
+    query = str(data.get("query", "")).strip()
+    filename = secure_filename(str(data.get("filename", "")).strip())
 
     if not query:
-        return jsonify({
-            "error": "Question is required"
-        }), 400
+        return jsonify({"error": "Question is required"}), 400
 
     if not filename:
-        return jsonify({
-            "error": "Filename is required"
-        }), 400
+        return jsonify({"error": "Filename is required"}), 400
 
     if not user_owns_document(user["id"], filename):
-        return jsonify({
-            "error": "Document not found or not accessible"
-        }), 404
+        return jsonify(
+            {"error": "Document not found or not accessible"}
+        ), 404
 
     index_key = document_index_key(user["id"], filename)
 
     if index_key not in documents:
-        return jsonify({
-            "error": "This document has not been indexed yet"
-        }), 400
+        return jsonify(
+            {
+                "error": (
+                    "This document is not indexed in the current backend "
+                    "session. Please analyze the document again."
+                )
+            }
+        ), 400
+
+    if not GEMINI_API_KEY:
+        return jsonify(
+            {"error": "GEMINI_API_KEY is not configured on the backend"}
+        ), 500
 
     try:
-        document = documents[index_key]
-        index = document["index"]
-        chunks = document["chunks"]
+        started = time.perf_counter()
+        indexed_document = documents[index_key]
+        index = indexed_document["index"]
+        chunks = indexed_document["chunks"]
 
-        # Create embedding for user's question
         query_embedding = create_embeddings(
             [query],
-            task_type="RETRIEVAL_QUERY"
+            task_type="RETRIEVAL_QUERY",
         )
 
-        # Search relevant chunks from selected document
-        distances, indices = index.search(
+        _, indices = index.search(
             query_embedding,
-            min(5, len(chunks))
+            min(5, len(chunks)),
         )
 
-        relevant_chunks = []
-        for chunk_index in indices[0]:
-            if chunk_index >= 0:
-                relevant_chunks.append(chunks[chunk_index])
-
+        relevant_chunks = [
+            chunks[chunk_index]
+            for chunk_index in indices[0]
+            if chunk_index >= 0
+        ]
         context = "\n\n".join(relevant_chunks)
 
         prompt = f"""
 You are IndustryBrain AI, an intelligent document assistant.
 
-Answer the user's question using ONLY the information provided in the document context below.
+Answer the user's question using ONLY the information provided in the
+document context below.
 
 If the answer is not present in the context, clearly say:
 "I couldn't find that information in the uploaded document."
@@ -917,26 +1115,37 @@ Answer clearly and concisely.
 """
 
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
+            model=ANSWER_MODEL,
+            contents=prompt,
         )
 
-        return jsonify({
-            "query": query,
-            "filename": filename,
-            "answer": response.text
-        })
+        app.logger.info(
+            "[TIMING] Ask request: %.2f seconds",
+            time.perf_counter() - started,
+        )
 
-    except Exception as error:
-        return jsonify({
-            "error": f"AI answer generation failed: {str(error)}"
-        }), 500
+        return jsonify(
+            {
+                "query": query,
+                "filename": filename,
+                "answer": response.text or "",
+            }
+        )
 
-#Run Server
+    except Exception:
+        app.logger.exception("AI answer generation failed")
+        return jsonify(
+            {"error": "AI answer generation failed. Check backend logs."}
+        ), 500
+
+
+# --------------------------------------------------
+# Run Server
 # --------------------------------------------------
 
 if __name__ == "__main__":
     app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
         debug=False,
-        port=5000
     )
