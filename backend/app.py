@@ -30,7 +30,12 @@ CORS(app)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-DATABASE = os.path.join(BASE_DIR, "users.db")
+# Use DATABASE_PATH when the host provides persistent storage.
+# If it is not set, keep the existing local SQLite location.
+DATABASE = os.getenv(
+    "DATABASE_PATH",
+    os.path.join(BASE_DIR, "users.db"),
+)
 
 ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -264,8 +269,21 @@ def login():
         )
         user = cursor.fetchone()
 
-        if not user or not check_password_hash(user[3], password):
+        # Diagnostic logs distinguish a missing account from a password
+        # mismatch without logging the email or password.
+        if not user:
+            app.logger.warning(
+                "[AUTH] Login rejected: no account found in configured database"
+            )
             return jsonify({"error": "Invalid email or password"}), 401
+
+        if not check_password_hash(user[3], password):
+            app.logger.warning(
+                "[AUTH] Login rejected: account found but password did not match"
+            )
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        app.logger.info("[AUTH] Login successful")
 
         token = secrets.token_urlsafe(32)
         cursor.execute(
